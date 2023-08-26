@@ -1,0 +1,51 @@
+base_model_path: ../ckpt/stable-diffusion-xl-base-1.0
+logdir: ../runs/face0-sdxl
+image_size: 768
+dataset:
+    _target_: ConcatDataset
+    datasets:
+        - _target_: FaceDetectionDatasetJson
+          multiple: 2
+          path: ../data/celeba/data.json
+          face_size_in_cropped: 160
+          face_crop_size: 196
+          image_resize_wh: ["${image_size}", "${image_size}"]
+          max_face_to_image_ratio: 2.5
+          use_mask: True
+        - _target_: FaceDetectionDatasetJson
+          multiple: 1
+          path: /workspace/data/annotation_filtered/ffhq.json
+          face_size_in_cropped: 160
+          face_crop_size: 196
+          image_resize_wh: ["${image_size}", "${image_size}"]
+          max_face_to_image_ratio: 2.5
+          use_mask: True
+image_encoder:
+    backbone:
+        _target_: InceptionResnetV1
+        pretrained: vggface2
+        multilayer_features: True
+    projection:
+        n_layers: 1
+        in_dim: [256, 896, 1792]
+        hidden_dim: 2048
+        out_dim: 2048
+train_steps: 100000
+batch_size: 1
+lr_unet: 2.0e-06
+lr_projection: 2.0e-06
+lr_image_backbone: 2.0e-06
+train_image_backbone: False
+dataloader_num_workers: 0
+gradient_accumulation_steps: 4
+optimizer:
+  _target_: adafactor
+  scale_parameter: False
+  relative_step: False
+  warmup_init: False
+scheduler:
+    name: constant
+checkpoint_interval: ./configs/checkpoint_interval.txt
+checkpoints_total_limit: 10
+seed: 42
+continue_checkpoint: null
