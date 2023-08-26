@@ -1,5 +1,8 @@
 # Face0 - SDXL
-Unofficial implementation of [Face0](https://arxiv.org/abs/2306.06638) with [SDXL](https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0) (Work in progress)
+Unofficial implementation of [Face0](https://arxiv.org/abs/2306.06638) with [SDXL](https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0) **(Work in progress)**
+
+
+![50000](https://github.com/bryandlee/face0-sdxl/assets/26464535/fa67fb98-d333-4d6e-9bac-9dfba49caf72)
 
 
 ## Train
