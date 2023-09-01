@@ -17,7 +17,7 @@ from accelerate.utils import ProjectConfiguration, set_seed
 from omegaconf import OmegaConf
 from tqdm import tqdm
 
-from data.dataset import build_dataset, get_data_iter, collate
+from data.dataset import build_dataset, get_data_iter, get_collate
 from model import build_encoders, load_sdxl
 from common.util import get_function_args
 
@@ -40,6 +40,33 @@ def build_optimizer(_target_, params, **kwargs):
     }
     optimizer_cls = optimizers[_target_]
     return optimizer_cls(params, **kwargs)
+
+
+def compute_snr(timesteps, noise_scheduler):
+    """
+    Computes SNR as per https://github.com/TiankaiHang/Min-SNR-Diffusion-Training/blob/521b624bd70c67cee4bdf49225915f5945a872e3/guided_diffusion/gaussian_diffusion.py#L847-L849
+    """
+    alphas_cumprod = noise_scheduler.alphas_cumprod
+    sqrt_alphas_cumprod = alphas_cumprod**0.5
+    sqrt_one_minus_alphas_cumprod = (1.0 - alphas_cumprod) ** 0.5
+
+    # Expand the tensors.
+    # Adapted from https://github.com/TiankaiHang/Min-SNR-Diffusion-Training/blob/521b624bd70c67cee4bdf49225915f5945a872e3/guided_diffusion/gaussian_diffusion.py#L1026
+    sqrt_alphas_cumprod = sqrt_alphas_cumprod.to(device=timesteps.device)[timesteps].float()
+    while len(sqrt_alphas_cumprod.shape) < len(timesteps.shape):
+        sqrt_alphas_cumprod = sqrt_alphas_cumprod[..., None]
+    alpha = sqrt_alphas_cumprod.expand(timesteps.shape)
+
+    sqrt_one_minus_alphas_cumprod = sqrt_one_minus_alphas_cumprod.to(device=timesteps.device)[
+        timesteps
+    ].float()
+    while len(sqrt_one_minus_alphas_cumprod.shape) < len(timesteps.shape):
+        sqrt_one_minus_alphas_cumprod = sqrt_one_minus_alphas_cumprod[..., None]
+    sigma = sqrt_one_minus_alphas_cumprod.expand(timesteps.shape)
+
+    # Compute SNR.
+    snr = (alpha / sigma) ** 2
+    return snr
 
 
 def train(
@@ -114,17 +141,13 @@ def train(
 
     # Build dataset
     dataset = build_dataset(**dataset)
-    dataloader = torch.utils.data.DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        collate_fn=collate,
-        num_workers=dataloader_num_workers,
-    )
-    logger.info(f"Dataset length: {len(dataset)}")
+    logger.info(f"Dataset Info:\n{dataset}")
 
     # Load model
     tokenizer1, tokenizer2, text_encoder1, text_encoder2, vae, unet = load_sdxl(base_model_path)
+
+    tokenizers = [tokenizer1, tokenizer2]
+    text_encoders = [text_encoder1, text_encoder2]
 
     vae.requires_grad_(False)
     text_encoder1.requires_grad_(False)
@@ -212,6 +235,16 @@ def train(
 
         logger.info(f"Loaded checkpoint from {continue_checkpoint}")
 
+    # Build dataloader
+    dataloader = torch.utils.data.DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        collate_fn=get_collate(tokenizer=tokenizers),
+        num_workers=dataloader_num_workers,
+    )
+
+    # Prepare with accelerator
     if train_image_backbone:
         (
             unet,
@@ -229,72 +262,6 @@ def train(
         )
 
     data_iter = get_data_iter(dataloader)
-
-    # XXX: Use fixed-prompt for now
-    # tokens to text embeds
-    prompt_embeds_list = []
-    text_encoders = [text_encoder1, text_encoder2]
-    tokenizers = [tokenizer1, tokenizer2]
-    caption = ["A photo of a person"]
-    for tokenizer_i, text_encoder_i in zip(tokenizers, text_encoders):
-        token = tokenizer_i(
-            caption,
-            padding="max_length",
-            truncation=True,
-            max_length=77,
-            return_tensors="pt",
-        ).input_ids
-
-        prompt_embeds_out = text_encoder_i(
-            token.to(text_encoder_i.device),
-            output_hidden_states=True,
-        )
-        pooled_prompt_embeds = prompt_embeds_out[0]
-        prompt_embeds = prompt_embeds_out.hidden_states[-2]
-        bsize, seq_len, hidden_size = prompt_embeds.shape
-        prompt_embeds = prompt_embeds.view(bsize, seq_len, -1)
-        prompt_embeds_list.append(prompt_embeds)
-
-    prompt_embeds = torch.concat(prompt_embeds_list, dim=-1)
-    pooled_prompt_embeds = pooled_prompt_embeds.view(bsize, -1)
-
-    # XXX: hard-coded for now
-    resolution = image_size
-    crops_coords_top_left_h = 0
-    crops_coords_top_left_w = 0
-    original_size = (resolution, resolution)
-    target_size = (resolution, resolution)
-    crops_coords_top_left = (crops_coords_top_left_h, crops_coords_top_left_w)
-
-    add_time_ids = list(original_size + crops_coords_top_left + target_size)
-    add_time_ids = torch.tensor([add_time_ids])
-    add_time_ids = add_time_ids.to(accelerator.device, dtype=prompt_embeds.dtype).repeat(bsize, 1)
-
-    def compute_snr(timesteps):
-        """
-        Computes SNR as per https://github.com/TiankaiHang/Min-SNR-Diffusion-Training/blob/521b624bd70c67cee4bdf49225915f5945a872e3/guided_diffusion/gaussian_diffusion.py#L847-L849
-        """
-        alphas_cumprod = noise_scheduler.alphas_cumprod
-        sqrt_alphas_cumprod = alphas_cumprod**0.5
-        sqrt_one_minus_alphas_cumprod = (1.0 - alphas_cumprod) ** 0.5
-
-        # Expand the tensors.
-        # Adapted from https://github.com/TiankaiHang/Min-SNR-Diffusion-Training/blob/521b624bd70c67cee4bdf49225915f5945a872e3/guided_diffusion/gaussian_diffusion.py#L1026
-        sqrt_alphas_cumprod = sqrt_alphas_cumprod.to(device=timesteps.device)[timesteps].float()
-        while len(sqrt_alphas_cumprod.shape) < len(timesteps.shape):
-            sqrt_alphas_cumprod = sqrt_alphas_cumprod[..., None]
-        alpha = sqrt_alphas_cumprod.expand(timesteps.shape)
-
-        sqrt_one_minus_alphas_cumprod = sqrt_one_minus_alphas_cumprod.to(device=timesteps.device)[
-            timesteps
-        ].float()
-        while len(sqrt_one_minus_alphas_cumprod.shape) < len(timesteps.shape):
-            sqrt_one_minus_alphas_cumprod = sqrt_one_minus_alphas_cumprod[..., None]
-        sigma = sqrt_one_minus_alphas_cumprod.expand(timesteps.shape)
-
-        # Compute SNR.
-        snr = (alpha / sigma) ** 2
-        return snr
 
     # Train
     progress_bar = tqdm(range(train_steps), disable=not accelerator.is_local_main_process, desc="Steps")
@@ -331,22 +298,45 @@ def train(
             # (this is the forward diffusion process)
             noisy_model_input = noise_scheduler.add_noise(model_input, noise, timesteps)
 
-            prompt_embeds_input = prompt_embeds.repeat(bsize, 1, 1)
+            # Tokens to text embeds
+            prompt_embeds_list = []
+            for token_ids_i, text_encoder_i in zip(batch["token_ids"], text_encoders):
+                prompt_embeds_out = text_encoder_i(
+                    token_ids_i.to(text_encoder_i.device),
+                    output_hidden_states=True,
+                )
+                pooled_prompt_embeds = prompt_embeds_out[0]
+                prompt_embeds = prompt_embeds_out.hidden_states[-2]
+                prompt_embeds = prompt_embeds.view(bsize, prompt_embeds.shape[1], -1)
+                prompt_embeds_list.append(prompt_embeds)
+
+            prompt_embeds = torch.concat(prompt_embeds_list, dim=-1)
+            pooled_prompt_embeds = pooled_prompt_embeds.view(bsize, -1)
+
+            # XXX: does not reflect the real size and crop coords for now
+            original_size = (image.shape[2], image.shape[3])
+            target_size = (image.shape[2], image.shape[3])
+            crops_coords_top_left = (0, 0)
+            add_time_ids = list(original_size + crops_coords_top_left + target_size)
+            add_time_ids = torch.tensor([add_time_ids])
+            add_time_ids = add_time_ids.to(accelerator.device, dtype=prompt_embeds.dtype).repeat(
+                bsize, 1
+            )
+
             # Drop face embeddings with prob 0.1
             override = torch.rand(bsize) > 0.1
-            prompt_embeds_input[override, -face_embeds.shape[1] :] = face_embeds[override].to(
-                dtype=prompt_embeds_input.dtype
+            prompt_embeds[override, -face_embeds.shape[1] :] = face_embeds[override].to(
+                dtype=prompt_embeds.dtype
             )
-            added_cond_kwargs = {
-                "time_ids": add_time_ids.repeat(bsize, 1),
-                "text_embeds": pooled_prompt_embeds.repeat(bsize, 1),
-            }
 
             model_pred = unet(
                 noisy_model_input,
                 timesteps,
-                prompt_embeds_input,
-                added_cond_kwargs=added_cond_kwargs,
+                prompt_embeds,
+                added_cond_kwargs={
+                    "time_ids": add_time_ids,
+                    "text_embeds": pooled_prompt_embeds,
+                },
             ).sample
 
             # Get the target for loss depending on the prediction type

@@ -12,14 +12,16 @@ dataset:
           image_resize_wh: ["${image_size}", "${image_size}"]
           max_face_to_image_ratio: 2.5
           use_mask: True
+          default_caption: "a person"
         - _target_: FaceDetectionDatasetJson
           multiple: 1
-          path: /workspace/data/annotation_filtered/ffhq.json
+          path: ../data/ffhq/data.json
           face_size_in_cropped: 160
           face_crop_size: 196
           image_resize_wh: ["${image_size}", "${image_size}"]
           max_face_to_image_ratio: 2.5
           use_mask: True
+          default_caption: "a person"
 image_encoder:
     backbone:
         _target_: InceptionResnetV1
